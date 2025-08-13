@@ -1,0 +1,295 @@
+
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IA → Shopify (OpenAI / Claude / Gemini)</title>
+ 
+</head>
+<body>
+<div class="w">
+  <img src="https://cdn.shopify.com/app-store/listing_images/f8fe6edba0d105b60366c4715ae2cdec/icon/CNTAw_22nI4DEAE=.png" alt="Oyoquid" class="logo" />
+  <h1 style="margin:0">IA → Shopify (multi-proveedor)</h1>
+  <small>Asistente que genera y ejecuta GraphQL sobre tu tienda.</small>
+
+  <div class="card">
+    <div class="row">
+      <label>Proveedor IA</label>
+      <select id="provider">
+        <option value="openai" selected>OpenAI</option>
+        <option value="claude">Claude (Anthropic)</option>
+        <option value="gemini">Gemini (Google)</option>
+      </select>
+    </div>
+
+    <div id="box-openai" class="row">
+      <label>OpenAI Key</label>
+      <input id="openaiKey" type="text" value="YOUR_OPENAI_KEY" />
+      <label>Modelo (OpenAI)</label>
+      <input id="openaiModel" type="text" value="gpt-4o-mini" />
+    </div>
+
+    <div id="box-claude" class="row hide">
+      <label>Anthropic Key</label>
+      <input id="claudeKey" type="text" value="" placeholder="YOUR_ANTHROPIC_KEY" />
+      <label>Modelo (Claude)</label>
+      <input id="claudeModel" type="text" value="claude-3-5-sonnet-latest" />
+    </div>
+
+    <div id="box-gemini" class="row hide">
+      <label>Gemini Key</label>
+      <input id="geminiKey" type="text" value="" placeholder="YOUR_GEMINI_KEY" />
+      <label>Modelo (Gemini)</label>
+      <input id="geminiModel" type="text" value="gemini-1.5-flash" />
+    </div>
+
+    <div class="row">
+      <label>Dominio de tu tienda</label>
+      <input id="shop" type="text" value="tutiendaa-myshopify-com" />
+      <label>Shopify Token</label>
+      <input id="shopifyToken" type="text" value="" />
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Tu instrucción para la IA</label>
+    <textarea id="message">crea un producto con título "pepeito"</textarea>
+    <button id="run">Generar plan y ejecutar</button>
+    <pre id="out">Esperando…</pre>
+    <small> Si el navegador bloquea CORS, usa el proxy local (proxy.js).</small>
+  </div>
+</div>
+
+
+</body> 
+</html>
+
+
+<style>
+   :root{
+  --bg:#0e1117; --card:#171b26; --muted:#2f3647; --text:#e5e7eb; --accent:#4f46e5;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial
+}
+.w{max-width:920px;margin:0 auto;padding:24px 16px;display:grid;gap:14px;justify-items:center}
+.logo{width:64px;height:64px;object-fit:contain}
+.card{
+  background:var(--card); border:1px solid rgba(255,255,255,.04);
+  border-radius:14px; padding:16px; display:grid; gap:12px; width:100%;
+  box-shadow:0 4px 16px rgba(0,0,0,.25)
+}
+.row{display:grid;gap:8px}
+label{font-weight:700}
+input,textarea,select{
+  width:100%; border:1px solid var(--muted); border-radius:10px;
+  padding:10px; background:#fff; color:#111
+}
+textarea{min-height:110px}
+button{
+  background:var(--accent); border:1px solid var(--accent); color:#fff;
+  padding:10px 14px; border-radius:10px; font-weight:800; cursor:pointer
+}
+button:hover{filter:brightness(1.05)}
+pre{
+  white-space:pre-wrap; word-break:break-word; background:#0b1020; color:#d7e1ff;
+  border-radius:10px; padding:10px; max-height:360px; overflow:auto
+}
+small{opacity:.8}
+.hide{display:none}
+
+</style>
+
+<script>
+  // ===== Config =====
+const API_VERSION = "2025-07";
+const ALLOW = new Set([
+  "productUpdate","productCreate","productVariantUpdate",
+  "inventorySetOnHandQuantity","priceListUpdate","customerUpdate"
+]);
+
+const PROXY_URL = "http://localhost:8787/proxy";
+
+// ===== UI =====
+const $ = (id) => document.getElementById(id);
+const out = $("out");
+const boxOpenAI = $("box-openai");
+const boxClaude = $("box-claude");
+const boxGemini = $("box-gemini");
+
+function show(x){
+  try{ out.textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2); }
+  catch{ out.textContent = String(x); }
+}
+function touchesSensitive(plan){
+  const s = (plan.action||"") + " " + (plan.gql||"");
+  return /price|inventory/i.test(s);
+}
+
+// ===== Sanitizadores =====
+function sanitizeHeaderValue(s){
+  return (s||"").normalize("NFKC").replace(/\u00A0/g,"").replace(/\s+/g,"").replace(/[^\x21-\x7E]/g,"");
+}
+function sanitizeShopDomain(s){
+  return (s||"").trim().normalize("NFKC").toLowerCase().replace(/\s+/g,"");
+}
+
+// ===== Prompt planificador =====
+function systemPrompt(){
+  return `
+Eres un planificador para Shopify Admin GraphQL.
+Devuelve SOLO JSON: {action, gql, variables, reason, confirm, dry_run}.
+- Acciones permitidas: ${JSON.stringify([...ALLOW])}.
+- Si afecta precio/inventario, usa confirm=false.
+- Variables SIEMPRE separadas.
+- Nada fuera del JSON.`.trim();
+}
+
+// ===== Plan con OpenAI =====
+async function planOpenAI(key, model, message){
+  const r = await fetch("https://api.openai.com/v1/chat/completions",{
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+sanitizeHeaderValue(key) },
+    body: JSON.stringify({
+      model: (model || "gpt-4o-mini"),
+      messages: [
+        { role:"system", content: systemPrompt() + "\n\nDevuelve SOLO un JSON válido. Sin texto extra." },
+        { role:"user", content: message }
+      ],
+      temperature: 0
+    })
+  });
+  const data = await r.json();
+  if(!r.ok) throw new Error("OpenAI error: " + JSON.stringify(data));
+  const content = data?.choices?.[0]?.message?.content || "";
+  let plan;
+  try { plan = JSON.parse(content); }
+  catch { throw new Error("OpenAI no devolvió JSON válido. Respuesta: " + content); }
+  if(!ALLOW.has(plan.action)) throw new Error(`Acción no permitida: ${plan.action}`);
+  return plan;
+}
+
+// ===== Plan con Claude =====
+async function planClaude(key, model, message){
+  const r = await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-api-key": sanitizeHeaderValue(key),
+      "anthropic-version":"2023-06-01"
+    },
+    body: JSON.stringify({
+      model: (model||"claude-3-5-sonnet-latest"),
+      max_tokens: 1024,
+      system: systemPrompt() + "\n\nDevuelve SOLO un JSON válido. Sin texto extra.",
+      messages:[ {role:"user", content: message} ]
+    })
+  });
+  const data = await r.json();
+  if(!r.ok) throw new Error("Claude error: "+JSON.stringify(data));
+  const text = data?.content?.[0]?.text || "";
+  let plan; try{ plan = JSON.parse(text); }catch{ throw new Error("Claude no devolvió JSON válido."); }
+  if(!ALLOW.has(plan.action)) throw new Error(`Acción no permitida: ${plan.action}`);
+  return plan;
+}
+
+// ===== Plan con Gemini =====
+async function planGemini(key, model, message){
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model||"gemini-1.5-flash")}:generateContent?key=${encodeURIComponent(sanitizeHeaderValue(key))}`;
+  const r = await fetch(url,{
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({
+      contents:[ { role:"user", parts:[ {text: systemPrompt() + "\n\nDevuelve SOLO un JSON válido. Sin texto extra.\n\n" + message} ] } ]
+    })
+  });
+  const data = await r.json();
+  if(!r.ok) throw new Error("Gemini error: "+JSON.stringify(data));
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  let plan; try{ plan = JSON.parse(text); }catch{ throw new Error("Gemini no devolvió JSON válido."); }
+  if(!ALLOW.has(plan.action)) throw new Error(`Acción no permitida: ${plan.action}`);
+  return plan;
+}
+
+// ===== Ejecutar Shopify (siempre por proxy, evita CORS) =====
+async function execShopify(shopInput, tokenInput, plan){
+  const shop = sanitizeShopDomain(shopInput);
+  const token = sanitizeHeaderValue(tokenInput);
+  if(!shop) throw new Error("Dominio de tienda inválido.");
+  if(!token) throw new Error("Token inválido.");
+
+  const url = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+  const payload = JSON.stringify({ query: plan.gql, variables: plan.variables || {} });
+
+  const r2 = await fetch(PROXY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+      body: payload
+    })
+  });
+  const data2 = await r2.json().catch(()=> ({}));
+  if(!r2.ok || data2.errors) throw new Error("Proxy/Shopify error: " + JSON.stringify(data2));
+  return data2;
+}
+
+// ===== UI =====
+$("provider").addEventListener("change", (e)=>{
+  const v = e.target.value;
+  boxOpenAI.classList.toggle("hide", v!=="openai");
+  boxClaude.classList.toggle("hide", v!=="claude");
+  boxGemini.classList.toggle("hide", v!=="gemini");
+});
+
+$("run").addEventListener("click", async ()=>{
+  const provider = $("provider").value;
+  const shop = $("shop").value;
+  const token = $("shopifyToken").value;
+  const message = $("message").value.trim();
+
+  const openaiKey = $("openaiKey").value;
+  const openaiModel = $("openaiModel").value.trim();
+  const claudeKey = $("claudeKey").value;
+  const claudeModel = $("claudeModel").value.trim();
+  const geminiKey = $("geminiKey").value;
+  const geminiModel = $("geminiModel").value.trim();
+
+  if(!shop)  return show("Falta dominio de la tienda.");
+  if(!token) return show("Falta Shopify Token.");
+  if(!message) return show("Escribe una instrucción.");
+  if(provider==='openai' && !openaiKey) return show("Falta OpenAI Key.");
+  if(provider==='claude' && !claudeKey) return show("Falta Anthropic Key.");
+  if(provider==='gemini' && !geminiKey) return show("Falta Gemini Key.");
+
+  try{
+    show("Generando plan…");
+    let plan;
+    if(provider==='openai') plan = await planOpenAI(openaiKey, openaiModel, message);
+    if(provider==='claude') plan = await planClaude(claudeKey, claudeModel, message);
+    if(provider==='gemini') plan = await planGemini(geminiKey, geminiModel, message);
+
+    show({ preview: plan });
+
+    if (touchesSensitive(plan) && !plan.confirm){
+      const ok = confirm("Esto puede afectar precio/inventario. ¿Confirmar ejecución?");
+      if(!ok){ return show({ preview: plan, info:"Ejecución cancelada." }); }
+      plan.confirm = true;
+    }
+    if(typeof plan.dry_run === "undefined") plan.dry_run = false;
+
+    show({ preview: plan, executing:true });
+    const result = await execShopify(shop, token, plan);
+    show({ executed:true, result });
+  }catch(err){
+    show(err?.message || String(err));
+  }
+});
+
+</script>
